@@ -1,0 +1,221 @@
+---
+- hosts: all
+  become: true
+  tasks:
+
+  - name: create proc sys net bridge
+    become: true
+    become_method: sudo
+    shell: | 
+      modprobe br_netfilter
+      sysctl -p 
+      mkdir -p /proc/sys/net/bridge
+      touch /proc/sys/net/bridge/bridge-nf-call-iptables
+      echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+
+  - name: enable ssh password authentication
+    become: true
+    become_method: sudo
+    shell: |
+      setenforce 0
+      sed -i 's/^SELINUX=.*$/SELINUX=disabled/g' /etc/selinux/config
+
+  - name: disable SE Linux
+    become: true
+    become_method: sudo
+    shell: |
+      sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+      systemctl restart sshd
+
+  - name: Install pre-reqs packages
+    yum:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - yum-utils
+      - device-mapper-persistent-data
+      - lvm2
+      - epel-release
+      - ca-certificates
+      - curl
+      - git
+      - mlocate
+
+  - name: Config Postgres Repo
+    yum:
+      name: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+      state: present
+      update_cache: yes
+
+  - name: Install Postgres Server
+    yum: 
+      name: epel-release,yum-utils,postgresql12,postgresql12-server
+      state: present
+      update_cache: yes
+    notify:
+      - postgres status
+
+  - name: Add vagrant user to postgres group
+    user:
+      name: vagrant
+      group: postgres
+
+  - name: Allow 'postgres' group to have passwordless sudo
+    lineinfile:
+      dest: /etc/sudoers
+      state: present
+      regexp: '^%postgres'
+      line: '%postgres ALL=(ALL) NOPASSWD: ALL'
+      validate: 'visudo -cf %s'
+
+  - name: Increase Runtime Directory Size
+    lineinfile:
+      dest: /etc/systemd/logind.conf
+      state: present
+      regexp: '^RuntimeDirectorySize'
+      line: 'RuntimeDirectorySize=100%'
+
+  - name: Increase run tmps
+    lineinfile:
+      dest: /etc/fstab
+      state: present
+      line : 'tmpfs   /run         tmpfs   rw,nodev,nosuid,size=2G          0  0'
+      validate: 'mount -a && echo %s'
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+
+  - name: initialize database
+    become: true
+    become_method: sudo
+    shell: |
+      /usr/pgsql-12/bin/postgresql-12-setup initdb
+
+  - name: Configure postgres listen addresses
+    lineinfile:
+      dest: /var/lib/pgsql/12/data/postgresql.conf
+      state: present
+      regexp: '^#listen_addresses'
+      line: "listen_addresses = '*' #"
+
+  - name: Configure postgres wal level
+    lineinfile:
+      dest: /var/lib/pgsql/12/data/postgresql.conf
+      state: present
+      regexp: '^#wal_level'
+      line: "wal_level = hot_standby #"
+
+  - name: Configure postgres archive command
+    lineinfile:
+      dest: /var/lib/pgsql/12/data/postgresql.conf
+      state: present
+      regexp: '^#archive_command'
+      line: "archive_command = 'test ! -f /mnt/server/archivedir/%f && cp %p /mnt/server/archivedir/%f'"
+
+  - name: Configure postgres max wal senders
+    lineinfile:
+      dest: /var/lib/pgsql/12/data/postgresql.conf
+      state: present
+      regexp: '^#max_wal_senders ='
+      line: "max_wal_senders = 10 #"
+
+  - name: configure /etc/hosts
+    lineinfile:
+      dest: /etc/hosts
+      state: present
+      regexp: '127.0.0.1[\t| ]*{{ node_name }}'
+      line: "{{ node_ip }}      {{ node_name }}"
+
+
+  - name: Configure postgres pg_hba.conf
+    blockinfile:
+      dest: /var/lib/pgsql/12/data/pg_hba.conf
+      block: |
+        host    all       {{ uusername }}    {{ engine }}/32    trust
+        host    all       {{ uusername }}    0.0.0.0/0    trust
+        host    all       {{ uusername }}    172.168.26.20/32    trust
+        host    all       {{ uusername }}    172.168.26.21/32    trust
+        host    replication    {{ uusername }}    172.168.26.20/32    trust
+        host    replication    {{ uusername }}    172.168.26.21/32    trust
+
+  - name: Create archivedir folder
+    file:
+      path: "/mnt/server/archivedir/"
+      state: directory
+      owner: "postgres"
+      group: postgres
+      mode: 770
+
+  - name: Start Postgres service
+    service:
+      name: postgresql-12
+      state: started
+      enabled: yes
+
+  - name: Create database user "{{ uusername }}" 
+    become: yes
+    become_user: postgres
+    shell: |
+      psql -c "create role {{ uusername }} SUPERUSER LOGIN REPLICATION password '{{ upassword }}';"
+
+
+  - name: Create user "{{ uusername }}" on postgres group
+    user: 
+      name: "{{ uusername }}"
+      password: "{{ upassword | password_hash('sha512') }}"
+      groups: postgres
+
+  - name: change postgres user password
+    user: name=postgres password={{ upassword }} update_password=always
+
+  - name: Create toolkit folder
+    file:
+      path: "/opt/{{ uusername }}/toolkit"
+      state: directory
+      owner: "{{ uusername }}"
+      group: postgres
+      mode: 0775
+
+  - name: set env in user .bash_profile
+    blockinfile:
+      dest: /home/{{ uusername }}/.bash_profile
+      block: |
+        export PATH=$PATH:/usr/pgsql-12/bin
+        export DELPHIX_PG_PATH="/usr/pgsql-12/bin:/var/lib/pgsql/12/data"
+
+  - name: set env in vagrant .bash_profile
+    blockinfile:
+      dest: /home/vagrant/.bash_profile
+      block: |
+        export PATH=$PATH:/usr/pgsql-12/bin
+        export DELPHIX_PG_PATH="/usr/pgsql-12/bin:/var/lib/pgsql/12/data"
+
+  - name: set env in postgres .bash_profile
+    blockinfile:
+      dest: /var/lib/pgsql/.bash_profile
+      block: |
+        export DELPHIX_PG_PATH="/usr/pgsql-12/bin:/var/lib/pgsql/12/data"
+
+  - name: add postgres bin to root .bash_profile
+    lineinfile:
+      dest: /root/.bash_profile
+      line: 'export PATH=$PATH:/usr/pgsql-12/bin'
+      owner: root
+
+  handlers:
+    - name: postgres status
+      service: name=postgresql-12 state=started
+

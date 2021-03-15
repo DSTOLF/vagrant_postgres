@@ -1,0 +1,11 @@
+---
+- hosts: all
+  become: true
+  tasks:
+
+  - name: Stop MySQL service
+    service:
+      name: mysqld
+      state: stopped
+      enabled: no
+
